@@ -1,0 +1,4 @@
+# Copy to bootstrap.auto.tfvars (git-ignored) and fill in. Never commit the copy.
+aws_account_id = "123456789012" # AWS documentation placeholder
+github_owner   = "teodor004"
+owner          = "teodor004"

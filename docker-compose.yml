@@ -1,0 +1,42 @@
+# Local AWS emulators. Exactly one runs at a time (both bind 4566):
+#   make up                      -> Floci (primary)
+#   make up EMULATOR=ministack   -> MiniStack (cross-check)
+#
+# Image names and the Lambda/Docker settings are UNVERIFIED (docs/VERIFICATION_LOG.md
+# V-001..V-005); set FLOCI_IMAGE / MINISTACK_IMAGE in .env after checking each project's docs.
+# The placeholders below fail to pull, on purpose.
+#
+# Security: the Docker socket gives the container root-equivalent access to the host, which
+# the emulators need to start Lambda containers. The API is bound to 127.0.0.1 only.
+
+name: tixlane
+
+x-emulator: &emulator
+  ports:
+    - "127.0.0.1:4566:4566"
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  environment:
+    AWS_DEFAULT_REGION: eu-central-1
+  networks:
+    tixlane:
+      # Lambda containers reach the emulator as http://emulator:4566 (EMULATOR_GAPS G-11).
+      aliases: [emulator]
+  restart: "no"
+
+services:
+  floci:
+    <<: *emulator
+    profiles: [floci]
+    image: ${FLOCI_IMAGE:-set-FLOCI_IMAGE-in-dot-env}
+    container_name: tixlane-floci
+
+  ministack:
+    <<: *emulator
+    profiles: [ministack]
+    image: ${MINISTACK_IMAGE:-set-MINISTACK_IMAGE-in-dot-env}
+    container_name: tixlane-ministack
+
+networks:
+  tixlane:
+    name: tixlane

@@ -1,0 +1,43 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build output (Lambda zip, plans, local outputs, local evidence)
+build/
+
+# OpenTofu - state, plans and real variable files never enter git.
+# .terraform.lock.hcl IS committed (generated in P0, see VERIFICATION_LOG V-009).
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+*.auto.tfvars
+
+# Secrets and local settings
+.env
+!.env.example
+*.pem
+*.key
+.claude/settings.local.json
+
+# Raw evidence may contain tokens before redaction; only curated files under docs/evidence/
+docs/evidence/raw/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,44 @@
+# Local (language: system) hooks only: they run the same tool versions as `make` and CI and
+# need no remote hook repositories, so there are no unverified `rev:` pins to maintain.
+# Install with `make hooks`.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+
+      - id: mypy
+        name: mypy (src)
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        files: ^src/.*\.py$
+
+      - id: tofu-fmt
+        name: tofu fmt
+        entry: tofu fmt
+        language: system
+        files: \.(tf|tofu|tfvars|tftest\.hcl)$
+
+      - id: tflint
+        name: tflint
+        entry: bash -c 'tflint --init --config "$PWD/.tflint.hcl" >/dev/null && tflint --recursive --config "$PWD/.tflint.hcl"'
+        language: system
+        pass_filenames: false
+        files: \.tf$
+
+      # CLI syntax for gitleaks >= 8.19 (V-018).
+      - id: gitleaks
+        name: gitleaks (staged changes)
+        entry: gitleaks git --pre-commit --staged --redact --verbose --config .gitleaks.toml
+        language: system
+        pass_filenames: false

@@ -1,0 +1,199 @@
+# Real-AWS teardown of infra/envs/aws (tixlane-prod), followed by a read-only tag sweep.
+#
+#   guard (typed confirmation) -> plan-destroy [approval 1] -> destroy [approval 2] + sweep
+#
+# Out of scope here, done by hand per docs/TEARDOWN.md: the bootstrap root (state bucket,
+# state CMK, OIDC provider, deploy role) - the state bucket is deleted last, by the architect.
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type "destroy tixlane-prod" to confirm
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tixlane-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  preflight:
+    name: preflight (confirmation, versions, action pins)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require the typed confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "destroy tixlane-prod" ]; then
+            echo "::error::Confirmation text did not match 'destroy tixlane-prod'."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every tool version verified and pinned
+        run: scripts/check_versions.sh
+      - name: Every action pinned to a commit SHA
+        run: scripts/check_action_pins.sh
+
+  plan-destroy:
+    name: plan -destroy (approval 1)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_owner: ${{ vars.OWNER }}
+      TF_VAR_permissions_boundary_arn: ${{ vars.WORKLOAD_BOUNDARY_ARN }}
+      TF_VAR_state_kms_key_id: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+      TF_VAR_cors_allowed_origins: ${{ vars.CORS_ALLOWED_ORIGINS }}
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      # filebase64sha256() is evaluated even for a destroy plan, so the package must exist.
+      - name: Build Lambda package
+        run: make build
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: tixlane-plan-destroy-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: tofu init
+        run: tofu -chdir=infra/envs/aws init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: tofu plan -destroy
+        run: tofu -chdir=infra/envs/aws plan -destroy -input=false -lock-timeout=120s -out=destroy.tfplan
+
+      - name: Destroy plan to job summary (review before approving)
+        run: |
+          tofu -chdir=infra/envs/aws show -no-color destroy.tfplan > "$RUNNER_TEMP/destroy.txt"
+          {
+            echo "### tixlane-prod DESTROY plan (run ${{ github.run_id }})"
+            echo '```'
+            head -c 60000 "$RUNNER_TEMP/destroy.txt"
+            if [ "$(wc -c < "$RUNNER_TEMP/destroy.txt")" -gt 60000 ]; then echo; echo "... truncated"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload destroy plan and package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: destroy-tfplan-${{ github.run_id }}
+          path: |
+            infra/envs/aws/destroy.tfplan
+            build/lambda.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  destroy:
+    name: apply destroy + tag sweep (approval 2)
+    needs: [preflight, plan-destroy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_owner: ${{ vars.OWNER }}
+      TF_VAR_permissions_boundary_arn: ${{ vars.WORKLOAD_BOUNDARY_ARN }}
+      TF_VAR_state_kms_key_id: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+      TF_VAR_cors_allowed_origins: ${{ vars.CORS_ALLOWED_ORIGINS }}
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Download destroy plan and package to their original paths
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: destroy-tfplan-${{ github.run_id }}
+          path: .
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: tixlane-destroy-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: tofu init
+        run: tofu -chdir=infra/envs/aws init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: tofu apply destroy plan
+        run: |
+          mkdir -p evidence
+          echo "DESTROY_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          tofu -chdir=infra/envs/aws apply -input=false destroy.tfplan
+          echo "DESTROY_FINISHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      # Read-only: Resource Groups Tagging API + IAM + Logs listings. KMS keys in
+      # PendingDeletion are reported separately (they vanish after the 7-day window).
+      - name: Tag sweep (Env=prod)
+        run: scripts/tag_sweep.sh --env prod --out evidence/tag-sweep.json
+
+      - name: Record timestamps
+        if: always()
+        run: |
+          mkdir -p evidence
+          jq -n \
+            --arg run_id "${{ github.run_id }}" \
+            --arg commit "$GITHUB_SHA" \
+            --arg destroy_started_at "${DESTROY_STARTED_AT:-}" \
+            --arg destroy_finished_at "${DESTROY_FINISHED_AT:-}" \
+            --arg sweep_finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{run_id: $run_id, commit: $commit, destroy_started_at: $destroy_started_at,
+              destroy_finished_at: $destroy_finished_at, sweep_finished_at: $sweep_finished_at}' \
+            > evidence/destroy-timestamps.json
+
+      # The reviewer copies these into docs/evidence/ and docs/TEARDOWN.md. tag-sweep.json lists
+      # ARNs (which embed the account ID): redact them before committing - gitleaks blocks it.
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-destroy-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 30

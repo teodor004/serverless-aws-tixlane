@@ -1,0 +1,35 @@
+# Usage assumptions for a 30-day month at portfolio traffic (smoke runs + one bounded spike).
+# docs/COST.md prorates them to the 48-hour window. Addresses use for_each wildcards (V-019).
+version: 0.1
+resource_usage:
+  module.compute.aws_lambda_function.fn[*]:
+    monthly_requests: 20000
+    request_duration_ms: 200
+  module.api.aws_apigatewayv2_api.this:
+    monthly_requests: 30000
+  module.data.aws_dynamodb_table.this:
+    monthly_write_request_units: 40000
+    monthly_read_request_units: 60000
+    storage_gb: 0.01
+    pitr_backup_storage_gb: 0.01
+  module.data.aws_kms_key.this:
+    monthly_requests: 15000
+  module.messaging.aws_sqs_queue.tickets:
+    monthly_requests: 30000
+  module.messaging.aws_sqs_queue.dlq:
+    monthly_requests: 1000
+  module.messaging.aws_sns_topic.ticket_issued:
+    monthly_requests: 10000
+  module.messaging.aws_sns_topic.ops_alerts:
+    monthly_requests: 100
+  module.storage.aws_s3_bucket.artefacts:
+    standard:
+      storage_gb: 0.01
+      monthly_tier_1_requests: 10000
+      monthly_tier_2_requests: 10000
+  module.compute.aws_cloudwatch_log_group.fn[*]:
+    storage_gb: 0.05
+    monthly_data_ingested_gb: 0.1
+  module.api.aws_cloudwatch_log_group.access:
+    storage_gb: 0.02
+    monthly_data_ingested_gb: 0.05

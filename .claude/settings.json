@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Bash(tofu -chdir=infra/envs/aws apply:*)",
+      "Bash(tofu -chdir=infra/envs/aws destroy:*)",
+      "Bash(tofu -chdir=infra/envs/aws import:*)",
+      "Bash(tofu -chdir=bootstrap apply:*)",
+      "Bash(tofu -chdir=bootstrap destroy:*)",
+      "Bash(tofu -chdir=bootstrap import:*)",
+      "Bash(terraform:*)",
+      "Bash(aws configure set:*)",
+      "Bash(aws sso login:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git commit --no-verify:*)",
+      "Bash(git add -f:*)",
+      "Bash(git add --force:*)",
+      "Read(~/.aws/**)",
+      "Read(./bootstrap/*.tfstate*)",
+      "Read(./bootstrap/*.auto.tfvars)",
+      "Read(./infra/envs/aws/*.tfvars)",
+      "Read(./.env)"
+    ],
+    "ask": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(docker compose:*)",
+      "Bash(make local-destroy:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"",
+            "timeout": 60
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

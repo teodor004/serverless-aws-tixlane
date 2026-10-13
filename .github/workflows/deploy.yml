@@ -1,0 +1,221 @@
+# Real-AWS deploy. The only path by which infrastructure reaches the account (ADR-0007).
+#
+#   preflight -> plan  [approval 1: environment production]
+#             -> apply [approval 2: review the plan in the plan job's summary first]
+#
+# Credentials come from GitHub OIDC only. The deploy role trusts exactly
+# repo:teodor004/serverless-aws-tixlane:environment:production, so a job that does not declare
+# `environment: production` cannot assume it. The saved plan is applied verbatim; OpenTofu
+# encrypts it (encryption.tofu) before it travels between jobs as an artifact.
+name: deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tixlane-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  preflight:
+    name: preflight (versions + action pins)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every tool version verified and pinned
+        run: scripts/check_versions.sh
+      - name: Every action pinned to a commit SHA
+        run: scripts/check_action_pins.sh
+
+  plan:
+    name: plan (approval 1)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_owner: ${{ vars.OWNER }}
+      TF_VAR_permissions_boundary_arn: ${{ vars.WORKLOAD_BOUNDARY_ARN }}
+      TF_VAR_state_kms_key_id: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+      TF_VAR_cors_allowed_origins: ${{ vars.CORS_ALLOWED_ORIGINS }}
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Build Lambda package
+        run: make build
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: tixlane-plan-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: tofu init (S3 backend, bucket from environment variable)
+        run: tofu -chdir=infra/envs/aws init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: tofu plan
+        run: tofu -chdir=infra/envs/aws plan -input=false -lock-timeout=120s -out=tfplan
+
+      # Sensitive values are redacted by tofu show; the stack has no secrets in any case.
+      - name: Plan to job summary (review this before approving apply)
+        run: |
+          tofu -chdir=infra/envs/aws show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
+          {
+            echo "### tixlane-prod plan (run ${{ github.run_id }}, commit ${GITHUB_SHA::12})"
+            echo '```'
+            head -c 60000 "$RUNNER_TEMP/plan.txt"
+            if [ "$(wc -c < "$RUNNER_TEMP/plan.txt")" -gt 60000 ]; then echo; echo "... truncated"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Plan is OpenTofu-encrypted (plan.enforced = true); the zip must be byte-identical at
+      # apply time because the plan records its hash.
+      - name: Upload plan and package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: |
+            infra/envs/aws/tfplan
+            build/lambda.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  apply:
+    name: apply saved plan + smoke (approval 2)
+    needs: [preflight, plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_owner: ${{ vars.OWNER }}
+      TF_VAR_permissions_boundary_arn: ${{ vars.WORKLOAD_BOUNDARY_ARN }}
+      TF_VAR_state_kms_key_id: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+      TF_VAR_cors_allowed_origins: ${{ vars.CORS_ALLOWED_ORIGINS }}
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      - name: Download plan and package to their original paths
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: .
+
+      - name: Record apply start
+        run: |
+          mkdir -p evidence
+          echo "APPLY_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: tixlane-apply-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: tofu init
+        run: tofu -chdir=infra/envs/aws init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      # A stale plan (state changed since plan) is rejected by tofu - re-run the workflow.
+      - name: tofu apply (exactly the reviewed plan)
+        run: tofu -chdir=infra/envs/aws apply -input=false tfplan
+
+      - name: Outputs (no sensitive values)
+        run: |
+          tofu -chdir=infra/envs/aws output -json > build/aws-outputs.json
+          echo "APPLY_FINISHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Install dependencies from the lock file
+        run: uv sync --locked
+
+      # Creates two throwaway Cognito users (random passwords, tokens masked in logs).
+      - name: Smoke test against real AWS
+        run: |
+          uv run python scripts/e2e.py --outputs build/aws-outputs.json --allow-real-aws \
+            --evidence-dir evidence smoke --k6-env-file "$RUNNER_TEMP/k6.env"
+
+      - name: k6 smoke
+        run: |
+          set -a; source "$RUNNER_TEMP/k6.env"; set +a
+          k6 run --summary-export evidence/k6-smoke-summary.json k6/smoke.js
+
+      - name: Delete smoke users
+        if: always()
+        run: |
+          if [ -f evidence/users.json ]; then
+            uv run python scripts/e2e.py --outputs build/aws-outputs.json --allow-real-aws \
+              --evidence-dir evidence cleanup --users-file evidence/users.json
+          fi
+          rm -f "$RUNNER_TEMP/k6.env"
+
+      - name: Record timestamps
+        if: always()
+        run: |
+          jq -n \
+            --arg run_id "${{ github.run_id }}" \
+            --arg commit "$GITHUB_SHA" \
+            --arg apply_started_at "${APPLY_STARTED_AT:-}" \
+            --arg apply_finished_at "${APPLY_FINISHED_AT:-}" \
+            --arg job_finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{run_id: $run_id, commit: $commit, apply_started_at: $apply_started_at,
+              apply_finished_at: $apply_finished_at, job_finished_at: $job_finished_at}' \
+            > evidence/deploy-timestamps.json
+          # Outputs are NOT copied into evidence: queue URLs and ARNs embed the account ID.
+
+      # The reviewer downloads this artifact and commits the curated files to docs/evidence/.
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-deploy-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 30

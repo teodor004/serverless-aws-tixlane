@@ -1,0 +1,21 @@
+# Checkov configuration. Resource-level suppressions are inline (#checkov:skip=ID:reason with
+# an ADR-0008 reference). The only config-level skip is CKV_GHA_7 below, which has no inline form.
+#
+# Scope: the deployable roots plus the workflows. Shared modules are evaluated through the
+# roots that call them, so infra/envs/local (emulator-only, reduced controls by design,
+# docs/EMULATOR_GAPS.md) is not listed - skip-path cannot exclude it because its findings are
+# reported against the module files (ADR-0008).
+directory:
+  - infra/envs/aws
+  - bootstrap
+  - .github
+framework:
+  - terraform
+  - github_actions
+skip-check:
+  # CKV_GHA_7 forbids workflow_dispatch inputs. destroy.yml (typed confirmation) and ops.yml
+  # (scenario choice) need them; every job still requires production approval (ADR-0008).
+  - CKV_GHA_7
+compact: true
+quiet: true
+download-external-modules: false

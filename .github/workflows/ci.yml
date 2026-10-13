@@ -1,0 +1,372 @@
+# Quality gates for every PR and every push to main. No job here touches real AWS: the only
+# infrastructure applied is infra/envs/local on an emulator inside the runner.
+#
+# Actions are referenced by major tag until P0 verification pins them to commit SHAs
+# (V-021). scripts/check_action_pins.sh in `preflight` keeps CI red until then - intended.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: eu-central-1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  preflight:
+    name: preflight (versions + action pins)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every tool version verified and pinned
+        run: scripts/check_versions.sh
+      - name: Every action pinned to a commit SHA
+        run: scripts/check_action_pins.sh
+
+  python:
+    name: python (ruff, mypy, pytest + coverage)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install dependencies from the lock file
+        run: uv sync --locked
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format --check
+        run: uv run ruff format --check .
+      - name: mypy (strict, src/)
+        run: uv run mypy
+      - name: pytest (Moto) - 90% coverage gate configured in pyproject.toml
+        run: uv run pytest
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  iac:
+    name: iac (fmt, validate, tflint, trivy, checkov)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      # Dummies so the aws root validates without credentials; validate never calls AWS.
+      TF_VAR_aws_account_id: "000000000000"
+      TF_VAR_state_kms_key_id: arn:aws:kms:eu-central-1:000000000000:key/00000000-0000-0000-0000-000000000000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: tofu fmt -check
+        run: tofu fmt -check -recursive
+
+      # filebase64sha256() in the compute module needs a file to exist; the real package is
+      # built only where it is deployed.
+      - name: Placeholder Lambda package
+        run: |
+          mkdir -p build
+          python3 -c "import zipfile; zipfile.ZipFile('build/lambda.zip', 'w').close()"
+
+      - name: tofu init + validate (local, aws, bootstrap)
+        run: |
+          for dir in infra/envs/local infra/envs/aws bootstrap; do
+            echo "::group::${dir}"
+            tofu -chdir="${dir}" init -backend=false -input=false
+            tofu -chdir="${dir}" validate
+            echo "::endgroup::"
+          done
+
+      - name: tflint
+        run: |
+          tflint --init --config "$PWD/.tflint.hcl"
+          tflint --recursive --config "$PWD/.tflint.hcl"
+        env:
+          # Avoids anonymous rate limits when tflint downloads the AWS ruleset.
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Trivy runs from the official image at a verified, pinned version instead of
+      # aquasecurity/trivy-action: supply-chain caution after the 2026 tag-hijack incident
+      # reported for that action (V-016, recollection - verify).
+      - name: trivy config
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "aquasec/trivy:${TRIVY_VERSION}" \
+            config --config trivy.yaml .
+
+      - name: checkov
+        run: uvx "checkov==${CHECKOV_VERSION}" --config-file .checkov.yaml
+
+  secrets:
+    name: secrets (gitleaks, full history)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      # CLI syntax for gitleaks >= 8.19 (V-018).
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo "ghcr.io/gitleaks/gitleaks:v${GITLEAKS_VERSION}" \
+            git --redact --config .gitleaks.toml .
+
+  integration-floci:
+    name: integration (Floci - gating)
+    needs: [preflight, python, iac]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      EMULATOR: floci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+      - name: Install dependencies from the lock file
+        run: uv sync --locked
+
+      # The image reference (pinned version/digest) lives in a repository variable, not in
+      # git, until V-001 is verified.
+      - name: Write .env
+        env:
+          FLOCI_IMAGE: ${{ vars.FLOCI_IMAGE }}
+        run: printf 'FLOCI_IMAGE=%s\n' "$FLOCI_IMAGE" > .env
+
+      - name: Start emulator
+        run: make up EMULATOR=floci
+      - name: Apply infra/envs/local (includes the empty-second-plan check)
+        run: make local-apply
+      - name: Integration tests
+        run: make itest EMULATOR=floci
+      - name: k6 smoke
+        run: make k6-smoke EMULATOR=floci
+
+      - name: Collect emulator logs
+        if: always()
+        run: |
+          mkdir -p build
+          docker compose --profile floci logs --no-color > build/emulator-floci.log 2>&1 || true
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-floci
+          path: |
+            build/emulator-floci.log
+            build/second-plan.txt
+            build/evidence-local
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Stop emulator
+        if: always()
+        run: make down
+
+  # Cross-check only (ADR-0001): differences are recorded in that ADR, so failures here do
+  # not block merges.
+  integration-ministack:
+    name: integration (MiniStack - cross-check)
+    needs: [preflight, python, iac]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      EMULATOR: ministack
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+      - name: Install dependencies from the lock file
+        run: uv sync --locked
+
+      - name: Write .env
+        env:
+          MINISTACK_IMAGE: ${{ vars.MINISTACK_IMAGE }}
+        run: printf 'MINISTACK_IMAGE=%s\n' "$MINISTACK_IMAGE" > .env
+
+      - name: Start emulator
+        run: make up EMULATOR=ministack
+      - name: Apply infra/envs/local (includes the empty-second-plan check)
+        run: make local-apply
+      - name: Integration tests (JUnit report for the ADR-0001 comparison)
+        run: |
+          TIXLANE_OUTPUTS=build/local-outputs.json TIXLANE_ENDPOINT_URL=http://localhost:4566 \
+            uv run pytest tests/integration -m integration --no-cov \
+            --junitxml=build/ministack-junit.xml
+      - name: k6 smoke
+        run: make k6-smoke EMULATOR=ministack
+
+      - name: Collect emulator logs
+        if: always()
+        run: |
+          mkdir -p build
+          docker compose --profile ministack logs --no-color > build/emulator-ministack.log 2>&1 || true
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-ministack
+          path: |
+            build/emulator-ministack.log
+            build/second-plan.txt
+            build/ministack-junit.xml
+            build/evidence-local
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Stop emulator
+        if: always()
+        run: make down
+
+  infracost:
+    name: infracost (estimate; skips without a key)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+    steps:
+      - name: Skip cleanly when no API key is configured
+        if: env.INFRACOST_API_KEY == ''
+        run: |
+          echo "Infracost skipped: INFRACOST_API_KEY not configured" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.INFRACOST_API_KEY != ''
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        if: env.INFRACOST_API_KEY != ''
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: infracost/actions/setup@e9d6e6cd65e168e76b0de50ff9957d2fe8bb1832 # v3.0.1
+        if: env.INFRACOST_API_KEY != ''
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          version: ${{ env.INFRACOST_VERSION }}
+
+      - name: Breakdown (head)
+        if: env.INFRACOST_API_KEY != ''
+        run: |
+          mkdir -p build
+          infracost breakdown --config-file infracost.yml --format json --out-file build/infracost.json
+
+      - name: Check out base ref
+        if: env.INFRACOST_API_KEY != '' && github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Breakdown (base) and diff
+        if: env.INFRACOST_API_KEY != '' && github.event_name == 'pull_request'
+        run: |
+          if [ -f base/infracost.yml ]; then
+            (cd base && infracost breakdown --config-file infracost.yml --format json \
+              --out-file ../build/infracost-base.json)
+            infracost diff --config-file infracost.yml --compare-to build/infracost-base.json \
+              --format json --out-file build/infracost-diff.json
+            {
+              echo "### Infracost delta vs base"
+              echo '```'
+              infracost output --path build/infracost-diff.json --format diff
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Base ref has no infracost.yml; no delta computed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Estimate table to job summary
+        if: env.INFRACOST_API_KEY != ''
+        run: |
+          {
+            echo "### Infracost estimate (list prices; ignores Free Tier and credits - see docs/COST.md)"
+            echo '```'
+            infracost output --path build/infracost.json --format table
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload estimate
+        if: env.INFRACOST_API_KEY != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: infracost
+          path: build/infracost*.json
+          retention-days: 30

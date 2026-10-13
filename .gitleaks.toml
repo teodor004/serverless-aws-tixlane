@@ -1,0 +1,18 @@
+# gitleaks configuration (schema: V-018). Extends the default ruleset with a rule for real
+# AWS account IDs embedded in ARNs, which the "never commit real account IDs" rule forbids.
+title = "tixlane"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "aws-account-id-in-arn"
+description = "AWS account ID embedded in an ARN"
+regex = '''arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:([0-9]{12}):'''
+secretGroup = 1
+keywords = ["arn:aws"]
+
+# Documentation placeholders (AWS docs examples and the emulator's account) are allowed.
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^(000000000000|123456789012|111122223333|444455556666)$''']

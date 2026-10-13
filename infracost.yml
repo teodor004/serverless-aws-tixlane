@@ -1,0 +1,12 @@
+# Infracost project config (V-019). HCL is parsed directly, so no AWS credentials are needed.
+version: 0.1
+projects:
+  - path: infra/envs/aws
+    name: tixlane-prod
+    usage_file: infracost-usage.yml
+    terraform_vars:
+      aws_account_id: "123456789012"
+      owner: infracost
+      permissions_boundary_arn: arn:aws:iam::123456789012:policy/placeholder
+      state_kms_key_id: arn:aws:kms:eu-central-1:123456789012:key/00000000-0000-0000-0000-000000000000
+      cors_allowed_origins: '["https://app.example.com"]'

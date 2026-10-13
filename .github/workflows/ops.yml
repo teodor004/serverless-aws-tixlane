@@ -1,0 +1,167 @@
+# Approval-gated data-plane operations against the deployed tixlane-prod stack (P6/P7).
+#
+# Why this exists: the project rules forbid mutating AWS calls from workstations, yet the
+# evidence pack needs a few real-AWS actions that are not infrastructure changes - sending a
+# poison message (DLQ alarm test), a bounded k6 spike, and read-only evidence snapshots.
+# Each runs here, under the same OIDC role and the same `production` approval as deploy.
+#
+# NOTE FOR THE ARCHITECT: this workflow is an addition beyond deploy.yml / destroy.yml in the
+# brief. It needs explicit approval; the alternative is folding these scenarios into
+# deploy.yml as a mode input.
+#
+# Scenarios
+#   snapshot             read-only: alarm states, Lambda metrics, reserved concurrency
+#   dlq-drill            poison message -> DLQ -> alarm; DLQ left full so the alarm can be
+#                        screenshotted (run dlq-drill-and-purge afterwards to clear it)
+#   dlq-drill-and-purge  as above, then purges the DLQ
+#   spike                bounded k6 spike: <= 50 VUs, <= 5 minutes (enforced in k6/spike.js)
+name: ops
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Operation to run against tixlane-prod
+        required: true
+        type: choice
+        options:
+          - snapshot
+          - dlq-drill
+          - dlq-drill-and-purge
+          - spike
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tixlane-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  preflight:
+    name: preflight (versions + action pins)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every tool version verified and pinned
+        run: scripts/check_versions.sh
+      - name: Every action pinned to a commit SHA
+        run: scripts/check_action_pins.sh
+
+  run:
+    name: ${{ inputs.scenario }} (approval)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SCENARIO: ${{ inputs.scenario }}
+      # tofu runs solely to read outputs; the state key decrypts state, the rest keeps any
+      # variable evaluation identical to deploy.yml.
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_owner: ${{ vars.OWNER }}
+      TF_VAR_permissions_boundary_arn: ${{ vars.WORKLOAD_BOUNDARY_ARN }}
+      TF_VAR_state_kms_key_id: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+      TF_VAR_cors_allowed_origins: ${{ vars.CORS_ALLOWED_ORIGINS }}
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+      E2E: uv run python scripts/e2e.py --outputs build/aws-outputs.json --allow-real-aws --evidence-dir evidence
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        if: inputs.scenario == 'spike'
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: tixlane-ops-${{ inputs.scenario }}-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Read stack outputs (no plan, no apply)
+        run: |
+          mkdir -p build evidence
+          tofu -chdir=infra/envs/aws init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          tofu -chdir=infra/envs/aws output -json > build/aws-outputs.json
+
+      - name: Install dependencies from the lock file
+        run: uv sync --locked
+
+      - name: Record start
+        run: echo "OPS_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Snapshot (read-only)
+        if: inputs.scenario == 'snapshot'
+        run: $E2E snapshot --hours 6
+
+      - name: DLQ drill (DLQ left full for the alarm screenshot)
+        if: inputs.scenario == 'dlq-drill'
+        run: $E2E dlq-drill
+
+      - name: DLQ drill, then purge
+        if: inputs.scenario == 'dlq-drill-and-purge'
+        run: $E2E dlq-drill --purge-after
+
+      - name: Prepare load (users + 5000-seat event)
+        if: inputs.scenario == 'spike'
+        run: $E2E prepare-load --k6-env-file "$RUNNER_TEMP/k6.env" --capacity 5000
+
+      - name: k6 spike (<= 50 VUs, <= 5 min)
+        if: inputs.scenario == 'spike'
+        run: |
+          set -a; source "$RUNNER_TEMP/k6.env"; set +a
+          k6 run --summary-export evidence/k6-spike-summary.json k6/spike.js
+
+      - name: Delete load-test users
+        if: always() && inputs.scenario == 'spike'
+        run: |
+          if [ -f evidence/users.json ]; then
+            $E2E cleanup --users-file evidence/users.json
+          fi
+          rm -f "$RUNNER_TEMP/k6.env"
+
+      - name: Record timestamps
+        if: always()
+        run: |
+          jq -n \
+            --arg scenario "$SCENARIO" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg started_at "${OPS_STARTED_AT:-}" \
+            --arg finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{scenario: $scenario, run_id: $run_id, started_at: $started_at, finished_at: $finished_at}' \
+            > "evidence/ops-${SCENARIO}-timestamps.json"
+
+      # The reviewer copies the curated files into docs/evidence/.
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-ops-${{ inputs.scenario }}-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 30

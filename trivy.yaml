@@ -1,0 +1,21 @@
+# Trivy misconfiguration scan (replaces tfsec). Keys: V-016 in docs/VERIFICATION_LOG.md.
+# Suppressions live inline next to the resource (#trivy:ignore:<ID>) with a justification
+# comment and an ADR-0008 reference; .trivyignore stays empty.
+exit-code: 1
+severity:
+  - MEDIUM
+  - HIGH
+  - CRITICAL
+scan:
+  scanners:
+    - misconfig
+  # The emulator root deliberately disables X-Ray, PITR and the permissions boundary
+  # (EMULATOR_GAPS.md); only deployable code is gated (ADR-0008).
+  skip-dirs:
+    - infra/envs/local
+    - .venv
+    - build
+misconfiguration:
+  scanners:
+    - terraform
+    - cloudformation

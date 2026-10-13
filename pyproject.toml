@@ -1,0 +1,77 @@
+[project]
+name = "tixlane"
+version = "0.1.0"
+description = "TixLane - event-ticketing reference architecture on AWS serverless"
+readme = "README.md"
+# 3.13 is the target Lambda runtime; 3.12 is the documented emulator fallback (EMULATOR_GAPS G-10).
+requires-python = ">=3.12,<3.14"
+# boto3/botocore are deliberately absent: the Lambda Python runtime provides them (V-029) and
+# scripts/build_lambda.py strips any transitive copy from the package.
+dependencies = [
+    "aws-lambda-powertools[tracer]>=3,<4",
+    "pydantic>=2.9,<3",
+]
+
+[dependency-groups]
+dev = [
+    "boto3>=1.35",
+    "boto3-stubs[cloudwatch,cognito-idp,dynamodb,s3,sns,sqs]>=1.35",
+    "moto[cognitoidp,dynamodb,s3,sns,sqs]>=5,<6",
+    "mypy>=1.11",
+    "pre-commit>=3.8",
+    "pytest>=8.3",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+]
+
+# No [build-system]: uv treats this as a non-packaged application; tests import from src/.
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+# build/ holds the staged Lambda dependencies; excluded explicitly because .gitignore is only
+# honoured inside a git repository.
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PT", "N", "C4", "DTZ", "TRY"]
+ignore = [
+    "TRY003", # long messages at raise sites are clearer than one exception class per message
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]
+# Scripts shell out to tofu/aws tooling with fixed argv and call URLs they validate first.
+"scripts/**" = ["S310", "S603", "S607"]
+# The guard hook shells out to git/gitleaks with fixed argv.
+".claude/hooks/*.py" = ["S603", "S607"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --cov=src/tixlane --cov-branch --cov-report=term-missing --cov-report=xml"
+testpaths = ["tests/unit"]
+pythonpath = ["src", "."]
+# Powertools warns when an invocation emits no business metric (e.g. GET routes); expected.
+filterwarnings = ["ignore:No application metrics to publish:UserWarning"]
+markers = [
+    "integration: runs against the emulator (make itest); never against real AWS",
+    "slow: takes longer than a few seconds (DLQ redrive, alarm evaluation)",
+]
+
+[tool.coverage.run]
+source = ["src/tixlane"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = false
