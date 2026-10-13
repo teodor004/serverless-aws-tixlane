@@ -15,12 +15,11 @@ teardown.
 > TixLane does in plain words, a glossary, what you can try without an AWS account, and
 > copy-paste commands with expected output, example API calls and troubleshooting.
 
-> **Status (2026-10-13): locally reviewed, not yet run against an emulator or AWS.** All
-> phases' artefacts are written. A local review (no AWS access) ran the unit suite (99 passed,
-> 99.6% coverage), ruff, mypy --strict, `tofu fmt`/`validate` on all roots, tflint, Trivy,
-> Checkov, actionlint, gitleaks and `k6 inspect`, and pinned every tool and action. The
-> emulator steps (P2/P3) are pending: Docker was unavailable on the review machine. Still
-> open in `docs/VERIFICATION_LOG.md`: emulator behaviour and AWS terms.
+> **Status (2026-10-13): CI partly green on GitHub; not yet run against an emulator or AWS.**
+> On GitHub, preflight, python (99 tests, 99.6% coverage), iac (fmt, validate, tflint, Trivy,
+> Checkov), secrets and infracost pass. The two integration jobs stop at "Start emulator"
+> until the repository variables `FLOCI_IMAGE` / `MINISTACK_IMAGE` are set. Every tool and
+> action is pinned. Still open in `docs/VERIFICATION_LOG.md`: emulator behaviour and AWS terms.
 
 ## What it does
 
@@ -65,7 +64,7 @@ filesystem, and `uv`, `tofu`, `k6`, `jq`, `curl` installed.
 
 ```bash
 cp .env.example .env          # set FLOCI_IMAGE (and MINISTACK_IMAGE) after verifying them (V-001, V-003)
-uv lock && make install       # first run only; creates uv.lock
+make install                  # uv sync from the committed uv.lock
 make test                     # unit tests (Moto), 90% coverage gate
 
 make up && make local-apply && make itest
@@ -151,7 +150,7 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) and the STRIDE model in
 | P1 | Domain, handlers, idempotency, conditional write; Moto tests ≥90% incl. 50→10 concurrency | **Passing locally**: 99 tests, 99.6% coverage; mutation check proves the 50→10 test |
 | P2 | IaC + apply on Floci, empty second plan, gaps documented | `tofu validate` clean on all roots; **apply pending (needs Docker + emulator images)** |
 | P3 | Integration: Cognito → API → confirm ≤30 s → S3; poison → DLQ → alarm; MiniStack ADR | 5 tests collect; **not run (needs emulator)** |
-| P4 | CI gates green, justified suppressions, Infracost in COST.md | Every gate green **locally**; suppressions proven (ADR-0008); CI run and Infracost (API key) pending |
+| P4 | CI gates green, justified suppressions, Infracost in COST.md | CI on GitHub: 5/7 jobs green; integration jobs await emulator image variables; suppressions proven (ADR-0008); Infracost needs an API key |
 | P5 | Architecture, 8 ADRs, Well-Architected, threat model, security, cost, teardown | Written |
 | P6 | Real deploy via OIDC + approval, smoke + k6 evidence | Workflow ready; **architect's day-1 setup first** |
 | P7 | Spike, screenshots, destroy, tag sweep 0, teardown + cost actuals | Workflows/runbook ready |
