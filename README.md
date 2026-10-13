@@ -11,6 +11,10 @@ on a local emulator, passes its quality gates in CI, deploys to a real AWS accou
 through an approval-gated OIDC pipeline, and is then torn down with a documented, verified
 teardown.
 
+> **New here?** Start with **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)**. It covers what
+> TixLane does in plain words, a glossary, what you can try without an AWS account, and
+> copy-paste commands with expected output, example API calls and troubleshooting.
+
 > **Status (2026-10-13): locally reviewed, not yet run against an emulator or AWS.** All
 > phases' artefacts are written. A local review (no AWS access) ran the unit suite (99 passed,
 > 99.6% coverage), ruff, mypy --strict, `tofu fmt`/`validate` on all roots, tflint, Trivy,
@@ -71,6 +75,8 @@ make up && make local-apply && make itest
 second `tofu plan` that must show no changes. Other targets: `make k6-smoke`, `make dlq-drill`,
 `make up EMULATOR=ministack` (cross-check), `make local-destroy`, `make down`, `make help`.
 Known or suspected emulator gaps and their flags: [`docs/EMULATOR_GAPS.md`](docs/EMULATOR_GAPS.md).
+A step-by-step walk-through with expected output, example `curl` calls and fixes for common
+errors is in [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md#6-level-2-run-the-whole-system-on-your-machine-emulator).
 
 ## Real-deploy story (P6–P7)
 

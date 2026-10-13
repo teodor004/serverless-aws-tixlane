@@ -13,6 +13,12 @@ variable "github_owner" {
   type        = string
 }
 
+variable "github_repo" {
+  description = "Repository name; the deploy role trusts only repo:<github_owner>/<github_repo>:environment:production."
+  type        = string
+  default     = "serverless-aws-tixlane"
+}
+
 variable "owner" {
   description = "Owner tag value."
   type        = string

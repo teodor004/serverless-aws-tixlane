@@ -156,6 +156,7 @@ module "github_oidc" {
   account_id                 = var.aws_account_id
   region                     = local.region
   github_owner               = var.github_owner
+  github_repo                = var.github_repo
   existing_oidc_provider_arn = var.existing_oidc_provider_arn
   state_bucket_arn           = aws_s3_bucket.state.arn
   state_kms_key_arn          = aws_kms_key.state.arn

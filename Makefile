@@ -22,9 +22,12 @@ OUTPUTS   := $(BUILD_DIR)/local-outputs.json
 EVIDENCE  := $(BUILD_DIR)/evidence-local
 TOFU      := tofu -chdir=$(LOCAL_DIR)
 TOFU_VARS := -var=python_runtime=python$(PY_VERSION)
+# Global e2e.py options must precede the subcommand (argparse).
+E2E       := uv run python scripts/e2e.py --outputs $(OUTPUTS) --endpoint-url $(EMULATOR_ENDPOINT) \
+             --evidence-dir $(EVIDENCE)
 
 .PHONY: help install hooks fmt lint test build up down logs local-init local-apply \
-        local-plan-check local-destroy itest smoke k6-smoke dlq-drill scan tflint trivy \
+        local-plan-check local-destroy itest smoke k6-smoke cleanup-users dlq-drill scan tflint trivy \
         checkov gitleaks verify infracost clean
 
 help: ## List targets
@@ -94,18 +97,18 @@ itest: ## Integration tests against the running emulator
 	  uv run pytest tests/integration -m integration --no-cov
 
 smoke: ## End-to-end smoke against the emulator; writes $(EVIDENCE)
-	uv run python scripts/e2e.py smoke --outputs $(OUTPUTS) --endpoint-url $(EMULATOR_ENDPOINT) \
-	  --evidence-dir $(EVIDENCE) --k6-env-file $(BUILD_DIR)/k6-local.env
+	$(E2E) smoke --k6-env-file $(BUILD_DIR)/k6-local.env
 
 k6-smoke: smoke ## k6 smoke against the emulator
 	set -a; source $(BUILD_DIR)/k6-local.env; set +a; \
 	  k6 run --summary-export $(EVIDENCE)/k6-smoke-summary.json k6/smoke.js
-	uv run python scripts/e2e.py cleanup --outputs $(OUTPUTS) --endpoint-url $(EMULATOR_ENDPOINT) \
-	  --users-file $(EVIDENCE)/users.json
+	$(MAKE) --no-print-directory cleanup-users
+
+cleanup-users: ## Delete the Cognito test users created by smoke
+	$(E2E) cleanup --users-file $(EVIDENCE)/users.json
 
 dlq-drill: ## Poison message -> DLQ -> alarm, against the emulator
-	uv run python scripts/e2e.py dlq-drill --outputs $(OUTPUTS) --endpoint-url $(EMULATOR_ENDPOINT) \
-	  --evidence-dir $(EVIDENCE) --purge-after
+	$(E2E) dlq-drill --purge-after
 
 # --- Quality gates (CI runs the same commands with pinned versions) ------------------------
 
